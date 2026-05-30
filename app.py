@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 import sqlite3
@@ -8,23 +8,13 @@ import binascii
 import secrets
 import uvicorn
 import os
-import cv2
-import time as time_module
 from datetime import datetime
-import threading
 
 # ---------- CONFIG ----------
 DB_FILE = "users.db"
 ITERATIONS = 100_000
 SALT_BYTES = 16
 HASH_BYTES = 32
-
-# Motion detection tuning
-MOTION_THRESHOLD      = 25      # pixel diff threshold (lower = more sensitive)
-MIN_CONTOUR_RATIO     = 0.005   # minimum contour as fraction of frame area (0.5%)
-MOTION_CONFIRM_FRAMES = 3       # consecutive frames needed to confirm motion
-BG_LEARN_RATE         = 0.05    # how fast background adapts (0=static, 1=instant)
-MOTION_COOLDOWN_SECS  = 5       # seconds to wait before logging a new event
 
 app = FastAPI()
 
@@ -51,18 +41,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(SecurityHeadersMiddleware)
 
-# ---------- Motion detection globals ----------
-static_back = None
-motion_list = [None, None]
-camera_active = False
-motion_detected = False
-current_frame = None
-camera_thread = None
-frame_lock = threading.Lock()
-motion_lock = threading.Lock()
 
-# Camera source: 0 = local webcam, or an RTSP/HTTP URL string
-camera_source = 0
 
 # ---------- DB helpers ----------
 def get_conn():
@@ -100,39 +79,10 @@ def init_db():
         duration_seconds REAL
     )
     """)
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS camera_config(
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        source TEXT NOT NULL DEFAULT '0',
-        label TEXT,
-        updated_at TEXT DEFAULT (datetime('now','localtime'))
-    )
-    """)
-    # Seed default row (local webcam index 0)
-    cursor.execute(
-        "INSERT OR IGNORE INTO camera_config (id, source, label) VALUES (1, '0', 'Local Webcam')"
-    )
     conn.commit()
     conn.close()
 
 init_db()
-
-# Load persisted camera source from DB
-def _load_camera_source():
-    global camera_source
-    try:
-        conn = get_conn()
-        cursor = conn.cursor()
-        cursor.execute("SELECT source FROM camera_config WHERE id = 1")
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            src = row["source"]
-            camera_source = int(src) if src.isdigit() else src
-    except Exception as e:
-        print(f"[startup] Could not load camera source: {e}")
-
-_load_camera_source()
 
 # ---------- crypto helpers ----------
 def generate_salt() -> str:
@@ -143,254 +93,6 @@ def hash_password(password: str, salt_hex: str) -> str:
     dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, ITERATIONS, dklen=HASH_BYTES)
     return binascii.hexlify(dk).decode()
 
-# ---------- Motion detection helpers ----------
-def log_motion_event(start: datetime, end: datetime):
-    try:
-        duration = (end - start).total_seconds()
-        conn = get_conn()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO motion_events (start_time, end_time, duration_seconds) VALUES (?, ?, ?)",
-            (start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"), round(duration, 2))
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"[motion_log error] {e}")
-
-def _make_error_frame(msg: str):
-    """Return a dark frame with an error message — shown while reconnecting."""
-    import numpy as np
-    frame = np.zeros((360, 640, 3), dtype="uint8")
-    cv2.putText(frame, "⚠ Camera Unavailable", (60, 150),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 100, 255), 2)
-    cv2.putText(frame, msg, (60, 200),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180, 180, 180), 1)
-    cv2.putText(frame, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), (60, 340),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
-    return frame
-
-
-def _open_capture(src):
-    """Open a cv2.VideoCapture with settings suited to the source type."""
-    is_rtsp = isinstance(src, str) and src.lower().startswith(("rtsp://", "rtsps://"))
-    is_http = isinstance(src, str) and src.lower().startswith(("http://", "https://"))
-
-    if is_rtsp:
-        # Force TCP transport — more reliable than default UDP on most networks
-        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    else:
-        cap = cv2.VideoCapture(src)
-
-    if is_rtsp or is_http:
-        # Give network streams time to negotiate
-        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10_000)
-        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10_000)
-
-    return cap
-
-
-# Shared error state so /api/camera/start can report why it failed
-camera_error: str = ""
-
-
-def motion_detection_loop():
-    global static_back, motion_list, camera_active, current_frame, motion_detected, camera_error
-
-    # Resolve source
-    src = camera_source
-    if isinstance(src, str) and src.isdigit():
-        src = int(src)
-
-    MAX_RECONNECT   = 10          # give up after this many consecutive failures
-    RECONNECT_DELAY = 5           # seconds between reconnect attempts
-    reconnect_count = 0
-    camera_error    = ""
-
-    print(f"[camera] Opening source: {src!r}")
-
-    while camera_active:
-        video = _open_capture(src)
-
-        if not video.isOpened():
-            reconnect_count += 1
-            msg = f"Could not open source '{src}' (attempt {reconnect_count}/{MAX_RECONNECT})"
-            print(f"[camera] {msg}")
-            camera_error = msg
-
-            if reconnect_count >= MAX_RECONNECT:
-                print("[camera] Max reconnect attempts reached. Giving up.")
-                camera_active = False
-                return
-
-            # Write an error frame to keep the UI informed
-            err_frame = _make_error_frame(f"Reconnecting… ({reconnect_count}/{MAX_RECONNECT})")
-            with frame_lock:
-                current_frame = err_frame
-
-            for _ in range(int(RECONNECT_DELAY / 0.2)):
-                if not camera_active:
-                    return
-                time_module.sleep(0.2)
-            continue
-
-        print(f"[camera] Stream opened successfully: {src!r}")
-        camera_error    = ""
-        reconnect_count = 0
-
-        static_back  = None
-        motion_list  = [None, None]
-        local_times  = []
-        motion_counter  = 0
-        last_motion_end = None
-        consecutive_failures = 0
-
-        while camera_active:
-            check, frame = video.read()
-            if not check:
-                consecutive_failures += 1
-                if consecutive_failures >= 30:   # ~1.5 s of bad reads
-                    print("[camera] Too many failed reads — reconnecting.")
-                    break
-                time_module.sleep(0.05)
-                continue
-
-            consecutive_failures = 0
-
-        motion = 0
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Improvement: resolution-adaptive blur kernel (always odd, scales with width)
-        h_px, w_px = gray.shape
-        blur_k = max(5, (w_px // 30) | 1)
-        gray = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
-
-        # Improvement: initialise background as float for weighted accumulation
-        if static_back is None:
-            static_back = gray.astype("float")
-            with frame_lock:
-                current_frame = frame.copy()
-            continue
-
-        # Improvement: adaptive background — slowly drifts with lighting changes
-        cv2.accumulateWeighted(gray, static_back, BG_LEARN_RATE)
-        bg_snap = cv2.convertScaleAbs(static_back)
-
-        diff_frame  = cv2.absdiff(bg_snap, gray)
-        # Improvement: configurable threshold instead of hardcoded 30
-        thresh_frame = cv2.threshold(diff_frame, MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)[1]
-        thresh_frame = cv2.dilate(thresh_frame, None, iterations=2)
-
-        cnts, _ = cv2.findContours(
-            thresh_frame.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        # Improvement: resolution-relative minimum contour area
-        frame_area = h_px * w_px
-        min_area   = frame_area * MIN_CONTOUR_RATIO
-        contour_detected = False
-
-        for contour in cnts:
-            if cv2.contourArea(contour) < min_area:
-                continue
-            contour_detected = True
-            (x, y, w, h) = cv2.boundingRect(contour)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 3)
-
-        # Improvement: require N consecutive frames before confirming motion
-        if contour_detected:
-            motion_counter = min(motion_counter + 1, MOTION_CONFIRM_FRAMES)
-        else:
-            motion_counter = max(motion_counter - 1, 0)
-
-        motion = 1 if motion_counter >= MOTION_CONFIRM_FRAMES else 0
-
-        # Overlay status text on frame
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if motion:
-            cv2.putText(frame, "⚠ MOTION DETECTED", (10, 35),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-        else:
-            cv2.putText(frame, "● Monitoring", (10, 35),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 220, 80), 2)
-        cv2.putText(frame, now_str, (10, frame.shape[0] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-
-        # Track motion start / end
-        motion_list.append(motion)
-        motion_list = motion_list[-2:]
-
-        if motion_list[-1] == 1 and motion_list[-2] == 0:
-            # Improvement: cooldown — skip logging if too soon after last event
-            now = datetime.now()
-            if last_motion_end is None or (now - last_motion_end).total_seconds() >= MOTION_COOLDOWN_SECS:
-                local_times.append(now)
-            else:
-                print(f"[motion] Cooldown active, skipping event start.")
-
-        if motion_list[-1] == 0 and motion_list[-2] == 1:
-            end_t = datetime.now()
-            local_times.append(end_t)
-            last_motion_end = end_t
-            if len(local_times) >= 2:
-                log_motion_event(local_times[-2], local_times[-1])
-
-        with motion_lock:
-            motion_detected = bool(motion)
-
-        with frame_lock:
-            current_frame = frame.copy()
-
-        # ── end inner while (per-frame) ──
-
-        # If motion was active when the inner loop exited
-        with motion_lock:
-            if motion_detected and len(local_times) % 2 == 1:
-                log_motion_event(local_times[-1], datetime.now())
-            motion_detected = False
-
-        static_back = None
-        video.release()
-
-        if camera_active:
-            print("[camera] Stream dropped — attempting reconnect in 5 s.")
-            err_frame = _make_error_frame("Stream lost — reconnecting…")
-            with frame_lock:
-                current_frame = err_frame
-            reconnect_count += 1
-            if reconnect_count >= MAX_RECONNECT:
-                print("[camera] Max reconnects reached.")
-                camera_active = False
-                return
-            for _ in range(int(RECONNECT_DELAY / 0.2)):
-                if not camera_active:
-                    break
-                time_module.sleep(0.2)
-
-    # ── end outer while (reconnect) ──
-    print("[camera] Stopped.")
-
-def generate_mjpeg():
-    """Yield MJPEG frames from the global current_frame buffer."""
-    while camera_active:
-        with frame_lock:
-            frame = current_frame.copy() if current_frame is not None else None
-
-        if frame is None:
-            time_module.sleep(0.05)
-            continue
-
-        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        if not ret:
-            continue
-
-        yield (
-            b'--frame\r\n'
-            b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n'
-        )
-        time_module.sleep(0.033)   # ~30 fps cap
 
 # ---------- request models ----------
 class SignupRequest(BaseModel):
@@ -455,126 +157,6 @@ def login(data: LoginRequest, request: Request):
     conn.commit()
     conn.close()
     raise HTTPException(status_code=401, detail="Invalid email or password.")
-
-# ---------- Camera endpoints ----------
-@app.post("/api/camera/start")
-def camera_start():
-    global camera_active, camera_thread, camera_error
-
-    if camera_active:
-        return {"status": "already_running"}
-
-    # Validate source before spawning thread
-    src = camera_source
-    if isinstance(src, str) and src.isdigit():
-        src = int(src)
-
-    is_network = isinstance(src, str) and src.lower().startswith(
-        ("rtsp://", "rtsps://", "http://", "https://")
-    )
-
-    # For local device index: do a quick open/close check
-    if not is_network:
-        test = cv2.VideoCapture(src)
-        opened = test.isOpened()
-        test.release()
-        if not opened:
-            hint = (
-                "No camera found at device index. "
-                "If using a network CCTV, go to Camera Settings and enter the RTSP/HTTP URL."
-            )
-            raise HTTPException(status_code=400, detail=hint)
-
-    # For network streams: don't block the HTTP request with a full connection attempt;
-    # the thread will handle reconnection and surface errors via camera_error.
-    camera_error  = ""
-    camera_active = True
-    camera_thread = threading.Thread(target=motion_detection_loop, daemon=True)
-    camera_thread.start()
-    return {"status": "ok", "source_type": "network" if is_network else "local", "source": str(camera_source)}
-
-@app.post("/api/camera/stop")
-def camera_stop():
-    global camera_active
-    camera_active = False
-    return {"status": "ok"}
-
-@app.get("/api/camera/status")
-def camera_status():
-    with motion_lock:
-        md = motion_detected
-    return {"active": camera_active, "motion": md, "error": camera_error}
-
-@app.get("/api/camera/stream")
-def camera_stream():
-    if not camera_active:
-        raise HTTPException(status_code=503, detail="Camera not running.")
-    return StreamingResponse(
-        generate_mjpeg(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
-
-@app.get("/api/motion/events")
-def motion_events(limit: int = 100):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, start_time, end_time, duration_seconds FROM motion_events ORDER BY id DESC LIMIT ?",
-        (limit,)
-    )
-    rows = [dict(r) for r in cursor.fetchall()]
-    conn.close()
-    today = datetime.now().strftime("%Y-%m-%d")
-    today_count = sum(1 for r in rows if r["start_time"].startswith(today))
-    return {"events": rows, "today_count": today_count, "total": len(rows)}
-
-
-# ---------- Camera config model ----------
-class CameraConfigRequest(BaseModel):
-    source: str          # "0" for local webcam, or RTSP/HTTP URL
-    label: str = ""      # friendly name, e.g. "Front Door"
-
-
-# ---------- Camera config endpoints ----------
-@app.get("/api/camera/config")
-def get_camera_config():
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT source, label, updated_at FROM camera_config WHERE id = 1")
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return {"source": row["source"], "label": row["label"], "updated_at": row["updated_at"]}
-    return {"source": "0", "label": "Local Webcam", "updated_at": None}
-
-
-@app.post("/api/camera/config")
-def set_camera_config(data: CameraConfigRequest):
-    global camera_source
-    if camera_active:
-        raise HTTPException(status_code=409, detail="Stop the camera before changing its source.")
-
-    # Basic validation: must be a digit (local index) or a URL
-    src = data.source.strip()
-    if not src:
-        raise HTTPException(status_code=400, detail="Source cannot be empty.")
-    if not src.isdigit() and not src.startswith(("rtsp://", "rtsps://", "http://", "https://")):
-        raise HTTPException(
-            status_code=400,
-            detail="Source must be a device index (e.g. '0') or a URL starting with rtsp://, http://, or https://"
-        )
-
-    camera_source = src
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE camera_config SET source=?, label=?, updated_at=datetime('now','localtime') WHERE id=1",
-        (src, data.label.strip())
-    )
-    conn.commit()
-    conn.close()
-    return {"status": "ok", "source": src, "label": data.label.strip()}
-
 
 
 # ---------- Admin endpoint ----------
@@ -1382,10 +964,7 @@ DASHBOARD_HTML = f"""
       <span class="nav-icon">🛡️</span>
       <span class="nav-label">Login Logs</span>
     </button>
-    <button class="nav-item" id="nav-settings" onclick="showView('settings')">
-      <span class="nav-icon">⚙️</span>
-      <span class="nav-label">Camera Settings</span>
-    </button>
+
     <div class="sidebar-spacer"></div>
     <div class="sidebar-logout">
       <a href="/" onclick="stopCamera(); localStorage.removeItem('yosan_user')">
@@ -1477,64 +1056,6 @@ DASHBOARD_HTML = f"""
       </div>
     </div>
 
-    <!-- ── View: Camera Settings ── -->
-    <div class="view" id="view-settings">
-      <div class="panel" style="max-width:600px;">
-        <div class="panel-header">
-          <span class="panel-title">⚙️ Network Camera Configuration</span>
-        </div>
-        <p style="font-size:0.88rem;color:#64748B;margin-bottom:1.2rem;line-height:1.6;">
-          Connect a physical IP/CCTV camera over the network. Stop the camera stream before changing settings.
-          Supported sources: local device index (<code>0</code>), RTSP streams, or HTTP MJPEG URLs.
-        </p>
-
-        <!-- Current config badge -->
-        <div id="cfg-current" style="background:#F0F7FF;border:1px solid #BFDBFE;border-radius:10px;padding:0.9rem 1.1rem;margin-bottom:1.2rem;font-size:0.85rem;color:#1E293B;">
-          <span style="font-weight:700;color:#2563EB;">Active source:</span>
-          <span id="cfg-active-source" style="font-family:monospace;">loading…</span>
-          &nbsp;·&nbsp;
-          <span id="cfg-active-label" style="color:#64748B;font-style:italic;"></span>
-          <span style="float:right;font-size:0.75rem;color:#94A3B8;" id="cfg-updated-at"></span>
-        </div>
-
-        <!-- Input fields -->
-        <div style="margin-bottom:0.9rem;">
-          <label style="display:block;font-size:0.78rem;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:5px;">Camera Source</label>
-          <input id="cfg-source" type="text" placeholder="e.g. rtsp://admin:pass@192.168.1.64:554/stream or 0"
-            style="width:100%;padding:10px 14px;border:1.5px solid #BFDBFE;border-radius:10px;font-size:0.93rem;font-family:monospace;color:#1E293B;background:#F8FAFF;outline:none;"/>
-          <div style="font-size:0.78rem;color:#94A3B8;margin-top:4px;">
-            Common RTSP formats:&nbsp;
-            <code>rtsp://user:pass@IP:554/stream1</code> &nbsp;·&nbsp;
-            <code>http://IP:8080/video</code> &nbsp;·&nbsp;
-            <code>0</code> for local webcam
-          </div>
-        </div>
-        <div style="margin-bottom:1.2rem;">
-          <label style="display:block;font-size:0.78rem;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:5px;">Camera Label (optional)</label>
-          <input id="cfg-label" type="text" placeholder="e.g. Front Door, Parking Lot"
-            style="width:100%;padding:10px 14px;border:1.5px solid #BFDBFE;border-radius:10px;font-size:0.93rem;color:#1E293B;background:#F8FAFF;outline:none;"/>
-        </div>
-
-        <!-- Tips -->
-        <details style="margin-bottom:1.2rem;font-size:0.83rem;color:#475569;background:#FFFBEB;border:1px solid #FDE68A;border-radius:10px;padding:0.8rem 1rem;">
-          <summary style="cursor:pointer;font-weight:700;color:#92400E;">📡 Physical CCTV Setup Tips</summary>
-          <ul style="margin-top:0.7rem;padding-left:1.2rem;line-height:1.9;">
-            <li>Connect camera to router/switch via RJ-45 Ethernet or use PoE switch.</li>
-            <li>Assign a <strong>static IP</strong> to the camera in your router's DHCP settings (or via camera's web UI).</li>
-            <li>Default RTSP port is <strong>554</strong>; HTTP streams often use <strong>80</strong> or <strong>8080</strong>.</li>
-            <li>Check camera manual for its stream path — common paths: <code>/stream1</code>, <code>/h264</code>, <code>/live/ch0</code>.</li>
-            <li>Ensure the server running this app is on the <strong>same LAN</strong> or has routed access to the camera IP.</li>
-            <li>Test with VLC → Media → Open Network Stream before configuring here.</li>
-          </ul>
-        </details>
-
-        <div style="display:flex;gap:0.8rem;flex-wrap:wrap;">
-          <button class="cam-btn" onclick="saveCameraConfig()" style="padding:10px 28px;">💾 Save Configuration</button>
-          <button class="cam-btn" style="background:linear-gradient(135deg,#475569,#64748B);box-shadow:0 3px 10px rgba(71,85,105,0.3);padding:10px 20px;" onclick="loadCameraConfig()">↻ Reload</button>
-        </div>
-        <p id="cfg-msg" style="margin-top:0.9rem;font-size:0.85rem;min-height:1.2rem;font-weight:500;"></p>
-      </div>
-    </div>
 </div><!-- .shell -->
 
 <script>
@@ -1551,55 +1072,10 @@ DASHBOARD_HTML = f"""
     document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
     document.getElementById('view-' + name).classList.add('active');
     document.getElementById('nav-' + name).classList.add('active');
-    const titles = {{ camera: 'Camera', motion: 'Motion Events', logs: 'Login Logs', settings: 'Camera Settings' }};
+    const titles = {{ camera: 'Camera', motion: 'Motion Events', logs: 'Login Logs' }};
     document.getElementById('page-title').textContent = titles[name] || name;
-    if (name === 'logs')     loadLogs();
-    if (name === 'motion')   loadMotionEvents();
-    if (name === 'settings') loadCameraConfig();
-  }}
-
-  // ── Camera Config ──
-  async function loadCameraConfig() {{
-    try {{
-      const res  = await fetch('/api/camera/config');
-      const data = await res.json();
-      document.getElementById('cfg-source').value       = data.source  || '';
-      document.getElementById('cfg-label').value        = data.label   || '';
-      document.getElementById('cfg-active-source').textContent = data.source  || '0';
-      document.getElementById('cfg-active-label').textContent  = data.label   || '';
-      document.getElementById('cfg-updated-at').textContent    = data.updated_at ? 'saved ' + data.updated_at : '';
-    }} catch(e) {{
-      document.getElementById('cfg-msg').textContent = '⚠️ Could not load config.';
-      document.getElementById('cfg-msg').style.color = '#DC2626';
-    }}
-  }}
-
-  async function saveCameraConfig() {{
-    const source = document.getElementById('cfg-source').value.trim();
-    const label  = document.getElementById('cfg-label').value.trim();
-    const msg    = document.getElementById('cfg-msg');
-    if (!source) {{ msg.textContent = '⚠️ Source is required.'; msg.style.color = '#DC2626'; return; }}
-    msg.textContent = '⏳ Saving…'; msg.style.color = '#64748B';
-    try {{
-      const res  = await fetch('/api/camera/config', {{
-        method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({{ source, label }})
-      }});
-      const data = await res.json();
-      if (res.ok) {{
-        msg.textContent = '✅ Saved! Restart the camera stream to apply.';
-        msg.style.color = '#059669';
-        document.getElementById('cfg-active-source').textContent = data.source;
-        document.getElementById('cfg-active-label').textContent  = data.label || '';
-      }} else {{
-        msg.textContent = '🔴 ' + (data.detail || 'Save failed.');
-        msg.style.color = '#DC2626';
-      }}
-    }} catch(e) {{
-      msg.textContent = '🔴 Server error: ' + e.message;
-      msg.style.color = '#DC2626';
-    }}
+    if (name === 'logs')   loadLogs();
+    if (name === 'motion') loadMotionEvents();
   }}
 
   // ── Camera ──
