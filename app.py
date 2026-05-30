@@ -159,6 +159,38 @@ def login(data: LoginRequest, request: Request):
     raise HTTPException(status_code=401, detail="Invalid email or password.")
 
 
+# ---------- Motion endpoints ----------
+class MotionLogRequest(BaseModel):
+    start_time: str
+    end_time: str
+    duration_seconds: float = 0
+
+@app.post("/api/motion/log")
+def motion_log(data: MotionLogRequest):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO motion_events (start_time, end_time, duration_seconds) VALUES (?, ?, ?)",
+        (data.start_time, data.end_time, data.duration_seconds)
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+@app.get("/api/motion/events")
+def motion_events(limit: int = 200):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, start_time, end_time, duration_seconds FROM motion_events ORDER BY id DESC LIMIT ?",
+        (limit,)
+    )
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_count = sum(1 for r in rows if r["start_time"].startswith(today))
+    return {"events": rows, "today_count": today_count, "total": len(rows)}
+
 # ---------- Admin endpoint ----------
 @app.get("/api/admin/logs")
 def admin_logs(limit: int = 100):
@@ -1011,6 +1043,7 @@ DASHBOARD_HTML = f"""
         <div class="cam-video-box" id="cam-box">
           <div class="cam-placeholder" id="cam-placeholder">🎥<br><br>Click <b>Start Camera</b> to begin<br>motion detection</div>
           <video id="cam-stream" autoplay playsinline muted style="display:none; width:100%; border-radius:10px;"></video>
+          <canvas id="motion-canvas" style="display:none;"></canvas>
           <div class="motion-indicator" id="motion-indicator">● Monitoring</div>
         </div>
         <div class="cam-controls">
@@ -1078,8 +1111,18 @@ DASHBOARD_HTML = f"""
     if (name === 'motion') loadMotionEvents();
   }}
 
-  // ── Camera ──
+  // ── Camera + Browser Motion Detection ──
   let browserStream = null;
+  let motionTimer   = null;
+  let prevPixels    = null;
+  let motionActive  = false;
+  let motionStart   = null;
+  let eventsToday   = 0;
+  let eventsTotal   = 0;
+  const MOTION_THRESHOLD  = 30;   // per-channel diff threshold
+  const MOTION_MIN_PCT    = 0.8;  // % of pixels that must change (0–100)
+  const MOTION_COOLDOWN   = 4000; // ms before logging a new event
+  let lastMotionLog = 0;
 
   async function startCamera() {{
     const status = document.getElementById('cam-status');
@@ -1094,22 +1137,101 @@ DASHBOARD_HTML = f"""
       document.getElementById('cam-placeholder').style.display = 'none';
       document.getElementById('stat-cam-status').textContent = 'Live';
       document.getElementById('stat-cam-status').style.color = '#059669';
-      status.textContent = '🟢 Camera active — Browser Webcam';
+      status.textContent = '🟢 Camera active — motion detection running';
       status.style.color = '#059669';
-      document.getElementById('motion-indicator').classList.add('visible');
-      document.getElementById('motion-indicator').textContent = '● Monitoring';
       document.getElementById('motion-indicator').className = 'motion-indicator visible ok';
+      document.getElementById('motion-indicator').textContent = '● Monitoring';
+      prevPixels = null;
+      video.addEventListener('loadeddata', startMotionDetection, {{ once: true }});
     }} catch(e) {{
-      status.textContent = '🔴 Camera access denied. Click the camera icon in your browser address bar and allow access.';
+      status.textContent = '🔴 Camera access denied. Allow camera in your browser settings.';
       status.style.color = '#DC2626';
     }}
   }}
 
+  function startMotionDetection() {{
+    const video  = document.getElementById('cam-stream');
+    const canvas = document.getElementById('motion-canvas');
+    const W = 160, H = 120;   // small resolution for perf
+    canvas.width  = W;
+    canvas.height = H;
+    const ctx = canvas.getContext('2d');
+
+    if (motionTimer) clearInterval(motionTimer);
+    motionTimer = setInterval(() => {{
+      if (!browserStream) return;
+      ctx.drawImage(video, 0, 0, W, H);
+      const frame = ctx.getImageData(0, 0, W, H).data;  // RGBA flat array
+
+      if (!prevPixels) {{ prevPixels = frame.slice(); return; }}
+
+      // Count changed pixels
+      let changed = 0;
+      const total = W * H;
+      for (let i = 0; i < frame.length; i += 4) {{
+        const dr = Math.abs(frame[i]   - prevPixels[i]);
+        const dg = Math.abs(frame[i+1] - prevPixels[i+1]);
+        const db = Math.abs(frame[i+2] - prevPixels[i+2]);
+        if (dr > MOTION_THRESHOLD || dg > MOTION_THRESHOLD || db > MOTION_THRESHOLD) changed++;
+      }}
+      prevPixels = frame.slice();
+
+      const pct = (changed / total) * 100;
+      const detected = pct >= MOTION_MIN_PCT;
+      const ind  = document.getElementById('motion-indicator');
+      const stat = document.getElementById('stat-motion');
+
+      if (detected) {{
+        ind.className = 'motion-indicator visible alert';
+        ind.textContent = '⚠ MOTION DETECTED';
+        stat.textContent = '⚠ Motion';
+        stat.style.color = '#DC2626';
+
+        if (!motionActive) {{
+          motionActive = true;
+          motionStart  = new Date();
+        }}
+
+        // Log event with cooldown
+        const now = Date.now();
+        if (now - lastMotionLog > MOTION_COOLDOWN) {{
+          lastMotionLog = now;
+          logMotionEvent();
+        }}
+      }} else {{
+        ind.className = 'motion-indicator visible ok';
+        ind.textContent = '● Monitoring';
+        stat.textContent = 'Clear';
+        stat.style.color = '#059669';
+        motionActive = false;
+        motionStart  = null;
+      }}
+    }}, 200);  // check 5× per second
+  }}
+
+  async function logMotionEvent() {{
+    const now = new Date().toISOString().replace('T',' ').substring(0,19);
+    try {{
+      await fetch('/api/motion/log', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ start_time: now, end_time: now, duration_seconds: 0 }})
+      }});
+      eventsTotal++;
+      eventsToday++;
+      document.getElementById('stat-events-today').textContent = eventsToday;
+      document.getElementById('stat-events-total').textContent = eventsTotal;
+    }} catch(e) {{}}
+  }}
+
   function stopCamera() {{
+    if (motionTimer) {{ clearInterval(motionTimer); motionTimer = null; }}
     if (browserStream) {{
-      browserStream.getTracks().forEach(track => track.stop());
+      browserStream.getTracks().forEach(t => t.stop());
       browserStream = null;
     }}
+    prevPixels   = null;
+    motionActive = false;
     const video = document.getElementById('cam-stream');
     video.srcObject = null;
     video.style.display = 'none';
