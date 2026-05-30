@@ -1431,7 +1431,7 @@ DASHBOARD_HTML = f"""
       <div class="panel cam-wrap">
         <div class="cam-video-box" id="cam-box">
           <div class="cam-placeholder" id="cam-placeholder">🎥<br><br>Click <b>Start Camera</b> to begin<br>motion detection</div>
-          <img id="cam-stream" style="display:none; width:100%; border-radius:10px;" alt="Camera feed">
+          <video id="cam-stream" autoplay playsinline muted style="display:none; width:100%; border-radius:10px;"></video>
           <div class="motion-indicator" id="motion-indicator">● Monitoring</div>
         </div>
         <div class="cam-controls">
@@ -1603,80 +1603,40 @@ DASHBOARD_HTML = f"""
   }}
 
   // ── Camera ──
-  let statusPollTimer = null;
+  let browserStream = null;
 
   async function startCamera() {{
     const status = document.getElementById('cam-status');
     status.textContent = '⏳ Starting camera…';
     status.style.color = '#64748B';
     try {{
-      // Tell backend to start OpenCV motion detection
-      const res = await fetch('/api/camera/start', {{ method: 'POST' }});
-      const data = await res.json();
-      if (res.ok) {{
-        // Point the img tag at the backend MJPEG stream (carries bounding boxes)
-        const img = document.getElementById('cam-stream');
-        img.src = '/api/camera/stream';
-        img.style.display = 'block';
-        document.getElementById('cam-placeholder').style.display = 'none';
-        document.getElementById('stat-cam-status').textContent = 'Live';
-        document.getElementById('stat-cam-status').style.color = '#059669';
-        const srcLabel = data.source_type === 'network' ? '🌐 Network CCTV' : '🖥 Local device';
-        status.textContent = `🟢 Camera active — ${{srcLabel}}`;
-        status.style.color = '#059669';
-
-        // Show motion indicator overlay and start polling
-        document.getElementById('motion-indicator').classList.add('visible');
-        startMotionPoll();
-      }} else {{
-        status.textContent = '🔴 ' + (data.detail || 'Could not start camera');
-        status.style.color = '#DC2626';
-      }}
+      const stream = await navigator.mediaDevices.getUserMedia({{ video: true }});
+      browserStream = stream;
+      const video = document.getElementById('cam-stream');
+      video.srcObject = stream;
+      video.style.display = 'block';
+      document.getElementById('cam-placeholder').style.display = 'none';
+      document.getElementById('stat-cam-status').textContent = 'Live';
+      document.getElementById('stat-cam-status').style.color = '#059669';
+      status.textContent = '🟢 Camera active — Browser Webcam';
+      status.style.color = '#059669';
+      document.getElementById('motion-indicator').classList.add('visible');
+      document.getElementById('motion-indicator').textContent = '● Monitoring';
+      document.getElementById('motion-indicator').className = 'motion-indicator visible ok';
     }} catch(e) {{
-      status.textContent = '🔴 Server error: ' + e.message;
+      status.textContent = '🔴 Camera access denied. Click the camera icon in your browser address bar and allow access.';
       status.style.color = '#DC2626';
     }}
   }}
 
-  function startMotionPoll() {{
-    if (statusPollTimer) clearInterval(statusPollTimer);
-    statusPollTimer = setInterval(async () => {{
-      try {{
-        const r = await fetch('/api/camera/status');
-        const d = await r.json();
-        const ind  = document.getElementById('motion-indicator');
-        const stat = document.getElementById('stat-motion');
-        const camStatus = document.getElementById('cam-status');
-
-        if (!d.active) {{ stopCamera(); return; }}
-
-        // Show camera_error if the thread hit a problem
-        if (d.error) {{
-          camStatus.textContent = '⚠️ ' + d.error;
-          camStatus.style.color = '#DC2626';
-        }}
-
-        if (d.motion) {{
-          ind.textContent = '⚠ MOTION DETECTED';
-          ind.className = 'motion-indicator visible alert';
-          stat.textContent = '⚠ Motion';
-          stat.style.color = '#DC2626';
-        }} else {{
-          ind.textContent = '● Monitoring';
-          ind.className = 'motion-indicator visible ok';
-          stat.textContent = 'Clear';
-          stat.style.color = '#059669';
-        }}
-      }} catch(e) {{}}
-    }}, 500);
-  }}
-
-  async function stopCamera() {{
-    if (statusPollTimer) {{ clearInterval(statusPollTimer); statusPollTimer = null; }}
-    try {{ await fetch('/api/camera/stop', {{ method: 'POST' }}); }} catch(e) {{}}
-    const img = document.getElementById('cam-stream');
-    img.src = '';
-    img.style.display = 'none';
+  function stopCamera() {{
+    if (browserStream) {{
+      browserStream.getTracks().forEach(track => track.stop());
+      browserStream = null;
+    }}
+    const video = document.getElementById('cam-stream');
+    video.srcObject = null;
+    video.style.display = 'none';
     document.getElementById('cam-placeholder').style.display = 'block';
     document.getElementById('stat-cam-status').textContent = 'Offline';
     document.getElementById('stat-cam-status').style.color = '#DC2626';
